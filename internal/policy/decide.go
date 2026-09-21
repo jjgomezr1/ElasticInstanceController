@@ -88,12 +88,25 @@ type Decision struct {
 // Filosofía: fácil subir (proteger al usuario), difícil bajar (conservador).
 //
 // Orden de evaluación (las guardas de seguridad van primero):
+//  0. Por debajo del mínimo -> subir SIEMPRE (garantía de capacidad base).
 //  1. Métrica no confiable -> mantener.
 //  2. Cooldown -> mantener.
 //  3. Subir (CPU alta O latencia alta) si hay margen.
 //  4. Bajar (todo tranquilo y hosts sanos) si hay más de la mínima.
 //  5. En cualquier otro caso -> mantener.
 func Decide(s Snapshot) Decision {
+	// 0. Garantía del mínimo: si hay menos instancias que el mínimo (p.ej. 0
+	// tras un fallo o un arranque en frío), se sube UNA sin importar métricas
+	// ni cooldown. El mínimo es una garantía estructural de disponibilidad,
+	// no una decisión basada en carga: saber que 0 < 1 no requiere métricas, y
+	// estar por debajo del mínimo pesa más que la anti-oscilación del cooldown.
+	if s.InstanciasCorriendo < config.MinInstancias {
+		return Decision{
+			Accion: Subir,
+			Motivo: "por debajo del minimo de instancias; se sube para garantizar la capacidad base (ignora metricas y cooldown)",
+		}
+	}
+
 	// 1. Datos no confiables: no decidir en falso.
 	if !s.MetricaConfiable {
 		return Decision{

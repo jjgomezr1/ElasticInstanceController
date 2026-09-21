@@ -23,6 +23,14 @@ func TestDecide(t *testing.T) {
 		ajustar  func(s *Snapshot)
 		esperada Accion
 	}{
+		// --- Garantía del mínimo (prioridad máxima) ---
+		{"cero instancias con metrica no confiable: sube (garantiza minimo)",
+			func(s *Snapshot) { s.InstanciasCorriendo = 0; s.MetricaConfiable = false }, Subir},
+		{"cero instancias en cooldown: sube igual (ignora cooldown)",
+			func(s *Snapshot) { s.InstanciasCorriendo = 0; s.MetricaConfiable = false; s.EnCooldown = true }, Subir},
+		{"cero instancias con todo en cero: sube",
+			func(s *Snapshot) { s.InstanciasCorriendo = 0; s.CPUMax = 0; s.LatenciaAvg = 0; s.HostsSaludables = 0; s.MetricaConfiable = false }, Subir},
+
 		// --- Guardas de seguridad ---
 		{"metrica no confiable con CPU alta: mantiene",
 			func(s *Snapshot) { s.CPUMax = 95; s.MetricaConfiable = false }, Mantener},
