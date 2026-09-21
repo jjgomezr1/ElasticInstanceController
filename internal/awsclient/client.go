@@ -10,14 +10,18 @@ import (
 
 	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
+	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	"github.com/aws/aws-sdk-go-v2/service/ssm"
 )
 
 // Clientes agrupa los clientes de los servicios de AWS que usa el controlador.
-// Por ahora solo EC2; cuando agreguemos CloudWatch y (más adelante) el ALB,
-// se añaden aquí sus clientes y se construyen una sola vez al arrancar.
+// Se construyen una sola vez al arrancar y se reutilizan en cada ciclo.
+// Cuando agreguemos el ALB, se añadirá aquí su cliente.
 type Clientes struct {
-	EC2 *ec2.Client
+	EC2        *ec2.Client
+	CloudWatch *cloudwatch.Client
+	SSM        *ssm.Client // para resolver la AMI vía parámetro público
 }
 
 // NuevosClientes carga la configuración por defecto del SDK y construye los
@@ -42,7 +46,9 @@ func NuevosClientes(ctx context.Context) (*Clientes, error) {
 	}
 
 	return &Clientes{
-		EC2: ec2.NewFromConfig(cfg),
+		EC2:        ec2.NewFromConfig(cfg),
+		CloudWatch: cloudwatch.NewFromConfig(cfg),
+		SSM:        ssm.NewFromConfig(cfg),
 	}, nil
 }
 

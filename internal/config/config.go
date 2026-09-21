@@ -4,7 +4,20 @@
 // un cambio de umbral se haga en un solo lugar.
 package config
 
-import "time"
+import (
+	"os"
+	"time"
+)
+
+// getenv devuelve el valor de una variable de entorno, o un valor por defecto
+// si no está definida. Permite sobreescribir parámetros de despliegue (AMI,
+// tipo, key, security group) sin recompilar el binario.
+func getenv(clave, porDefecto string) string {
+	if v := os.Getenv(clave); v != "" {
+		return v
+	}
+	return porDefecto
+}
 
 // --- Límites de capacidad (impuestos por el reto) ---
 
@@ -38,10 +51,13 @@ const (
 	// Punto medio entre reaccionar a picos aislados y tardar demasiado.
 	VentanaObservacion = 4 * time.Minute
 
-	// PeriodoMetrica es el "Period" que se le pide a CloudWatch (en segundos).
-	// Coincide con la ventana para obtener un promedio por instancia sobre
-	// toda la ventana de observación.
-	PeriodoMetricaSegundos = 240
+	// PeriodoPuntoSegundos es la granularidad de cada punto que se pide a
+	// CloudWatch, en segundos. 60s coincide con el ritmo de publicación del
+	// monitoreo detallado de EC2, y hace que dentro de la ventana haya varios
+	// puntos con timestamps recientes (evita el problema de un único bucket
+	// grande cuyo timestamp quedaría siempre por fuera del límite de
+	// antigüedad).
+	PeriodoPuntoSegundos = 60
 
 	// MaxAntiguedadMetrica: si el dato más reciente de una métrica es más
 	// viejo que esto, se considera no confiable y el controlador mantiene el
@@ -89,4 +105,31 @@ const (
 	TagClave = "ManagedBy"
 	// TagValor es el valor esperado del tag.
 	TagValor = "autoscaling-controller"
+)
+
+// --- Parámetros para lanzar instancias nuevas (Pieza 4) ---
+//
+// Son valores propios de la cuenta/región. Tienen un valor por defecto acorde
+// al Learner Lab, pero se pueden sobreescribir por variable de entorno sin
+// recompilar (útil si el security group o la key cambian de nombre).
+var (
+	// TipoInstancia es el tipo EC2 de las instancias sujeto que se lanzan.
+	TipoInstancia = getenv("TIPO_INSTANCIA", "t3.micro")
+
+	// KeyPair es el par de claves para poder entrar por SSH a las instancias
+	// lanzadas.
+	KeyPair = getenv("KEY_PAIR", "vockey")
+
+	// SecurityGroupID es el grupo de seguridad que se asigna a las instancias
+	// lanzadas (el que permite SSH y el tráfico de la app).
+	SecurityGroupID = getenv("SECURITY_GROUP", "sg-0eb76ab33dcac3913")
+
+	// ParametroSSMImagen es el nombre del parámetro público de SSM que siempre
+	// apunta al ID de la AMI más reciente de Ubuntu 24.04 (Noble) amd64 en la
+	// región actual. Resolverlo en tiempo de ejecución evita hardcodear un
+	// ami-... que cambia por región y con el tiempo.
+	ParametroSSMImagen = getenv(
+		"SSM_AMI_PARAM",
+		"/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
+	)
 )

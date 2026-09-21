@@ -6,8 +6,12 @@
 //
 //	go run ./cmd/permcheck
 //
-// Por ahora prueba la Pieza 1: lista las instancias gestionadas y corriendo.
-// Imprime los IDs encontrados o el error de AWS de forma legible.
+// Prueba dos piezas:
+//   - Pieza 1: lista las instancias gestionadas y corriendo (tag + running).
+//   - Pieza 2: consulta la CPU en CloudWatch y arma el policy.Snapshot.
+//
+// Imprime lo encontrado o el error de AWS de forma legible. No actúa sobre la
+// infraestructura (no lanza ni termina nada).
 package main
 
 import (
@@ -26,7 +30,7 @@ func main() {
 	ctx, cancelar := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancelar()
 
-	fmt.Println("== permcheck: prueba de la Pieza 1 (inventario) ==")
+	fmt.Println("== permcheck: prueba de las Piezas 1 y 2 ==")
 
 	// 1. Construir los clientes de AWS (carga credenciales + region us-east-1).
 	clientes, err := awsclient.NuevosClientes(ctx)
@@ -36,8 +40,8 @@ func main() {
 	}
 	fmt.Println("Clientes de AWS creados correctamente (credenciales y region OK).")
 
-	// 2. Llamar a la Pieza 1.
-	fmt.Printf("Buscando instancias con tag %s=%s en estado running...\n",
+	// --- Pieza 1: inventario ---
+	fmt.Printf("\n[Pieza 1] Buscando instancias con tag %s=%s en estado running...\n",
 		config.TagClave, config.TagValor)
 	ids, err := awsclient.ListManagedInstances(ctx, clientes.EC2)
 	if err != nil {
@@ -45,14 +49,33 @@ func main() {
 		os.Exit(1)
 	}
 
-	// 3. Reportar el resultado.
 	if len(ids) == 0 {
 		fmt.Println("Resultado: 0 instancias gestionadas corriendo.")
-		fmt.Println("(La llamada a AWS funciono; simplemente no hay instancias con ese tag todavia.)")
-		return
+	} else {
+		fmt.Printf("Resultado: %d instancia(s) gestionada(s) corriendo:\n", len(ids))
+		for _, id := range ids {
+			fmt.Printf("  - %s\n", id)
+		}
 	}
-	fmt.Printf("Resultado: %d instancia(s) gestionada(s) corriendo:\n", len(ids))
-	for _, id := range ids {
-		fmt.Printf("  - %s\n", id)
+
+	// --- Pieza 2: métricas de CPU desde CloudWatch ---
+	fmt.Printf("\n[Pieza 2] Consultando CPU en CloudWatch (ventana %s, punto %ds)...\n",
+		config.VentanaObservacion, config.PeriodoPuntoSegundos)
+	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, ids)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "ERROR consultando CloudWatch: %v\n", err)
+		os.Exit(1)
+	}
+
+	fmt.Println("Snapshot construido:")
+	fmt.Printf("  Instancias corriendo : %d\n", snap.InstanciasCorriendo)
+	fmt.Printf("  CPU maxima           : %.2f%%\n", snap.CPUMax)
+	fmt.Printf("  Metrica confiable    : %t\n", snap.MetricaConfiable)
+	fmt.Printf("  En cooldown          : %t\n", snap.EnCooldown)
+
+	if !snap.MetricaConfiable {
+		fmt.Println("  (Nota: metrica no confiable. Posibles causas: monitoreo detallado")
+		fmt.Println("   apagado -> aun no hay dato dentro de la ventana de 4 min; o la")
+		fmt.Println("   instancia acaba de arrancar y no ha publicado CPU todavia.)")
 	}
 }
