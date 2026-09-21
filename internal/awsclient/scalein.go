@@ -5,7 +5,10 @@ import (
 	"fmt"
 	"time"
 
+	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
+	elbtypes "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2/types"
 
 	"autoscaling-controller/internal/config"
 )
@@ -14,12 +17,11 @@ import (
 // Criterio: la MÁS NUEVA (mayor LaunchTime). Al reducir carga tiene sentido
 // deshacer el último scale-out, conservando las instancias veteranas que ya
 // están "calientes" y con tráfico establecido.
-//
-// Consulta a EC2 el LaunchTime de cada instancia; no ampliamos el inventario
-// (Pieza 1) para no tocar código ya validado.
 func elegirInstanciaATerminar(ctx context.Context, cEC2 *ec2.Client, ids []string) (string, error) {
-	salida, err := cEC2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
-		InstanceIds: ids,
+	salida, err := ReintentarConValor(ctx, "DescribeInstances (LaunchTime)", func() (*ec2.DescribeInstancesOutput, error) {
+		return cEC2.DescribeInstances(ctx, &ec2.DescribeInstancesInput{
+			InstanceIds: ids,
+		})
 	})
 	if err != nil {
 		return "", fmt.Errorf("fallo al consultar LaunchTime de las instancias: %w", err)
@@ -33,7 +35,6 @@ func elegirInstanciaATerminar(ctx context.Context, cEC2 *ec2.Client, ids []strin
 			if inst.InstanceId == nil || inst.LaunchTime == nil {
 				continue
 			}
-			// Nos quedamos con la de LaunchTime más reciente.
 			if elegido == "" || inst.LaunchTime.After(lanzamientoElegido) {
 				elegido = *inst.InstanceId
 				lanzamientoElegido = *inst.LaunchTime
@@ -47,14 +48,45 @@ func elegirInstanciaATerminar(ctx context.Context, cEC2 *ec2.Client, ids []strin
 	return elegido, nil
 }
 
-// TerminarInstancia es la Pieza 5: elige una instancia (la más nueva) y la
-// termina. Respeta el mínimo de instancias como guarda defensiva, aunque
-// policy.Decide() ya bloquea bajar cuando solo queda una.
+// esperarDraining sondea el estado del target hasta que deje de estar
+// "draining" (o hasta agotar EsperaMaxDraining). Durante el draining el ALB no
+// envía tráfico nuevo pero deja terminar las peticiones en curso.
+func esperarDraining(ctx context.Context, cELB *elbv2.Client, id string) {
+	limite := time.Now().Add(config.EsperaMaxDraining)
+	for time.Now().Before(limite) {
+		salida, err := cELB.DescribeTargetHealth(ctx, &elbv2.DescribeTargetHealthInput{
+			TargetGroupArn: awssdk.String(config.TargetGroupARN),
+			Targets:        []elbtypes.TargetDescription{{Id: awssdk.String(id)}},
+		})
+		// Ante un error transitorio consultando, seguimos esperando hasta el
+		// tope; no abortamos el draining por eso.
+		if err == nil {
+			if len(salida.TargetHealthDescriptions) == 0 {
+				// El target ya no está en el grupo: draining completo.
+				return
+			}
+			estado := salida.TargetHealthDescriptions[0].TargetHealth.State
+			if estado != elbtypes.TargetHealthStateEnumDraining {
+				// Ya no está draining (unused/desregistrado): listo.
+				return
+			}
+		}
+
+		select {
+		case <-ctx.Done():
+			return
+		case <-time.After(config.IntervaloSondeoDraining):
+		}
+	}
+}
+
+// TerminarInstancia es la Pieza 5 (fase ALB): baja segura. Elige una instancia
+// (la más nueva), la DESREGISTRA del Target Group, espera el draining y luego
+// la TERMINA. Draining SÍNCRONO (bloquea el ciclo ~30-45s); es aceptable
+// porque la app responde en milisegundos y bajar solo ocurre en baja demanda.
 //
-// NOTA: cuando exista el ALB, antes del terminate habrá que desregistrar el
-// target y esperar el "draining". En esta fase (sin ALB) el terminate es
-// directo. Devuelve el ID de la instancia terminada.
-func TerminarInstancia(ctx context.Context, cEC2 *ec2.Client, ids []string) (string, error) {
+// Respeta el mínimo de instancias como guarda defensiva.
+func TerminarInstancia(ctx context.Context, cEC2 *ec2.Client, cELB *elbv2.Client, ids []string) (string, error) {
 	// Guarda defensiva: nunca bajar del mínimo.
 	if len(ids) <= config.MinInstancias {
 		return "", fmt.Errorf("no se termina: hay %d instancia(s) y el minimo es %d",
@@ -66,8 +98,28 @@ func TerminarInstancia(ctx context.Context, cEC2 *ec2.Client, ids []string) (str
 		return "", err
 	}
 
-	_, err = cEC2.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
-		InstanceIds: []string{elegido},
+	// 1. Desregistrar del Target Group: deja de recibir tráfico nuevo y entra
+	// en "draining".
+	err = Reintentar(ctx, "DeregisterTargets", func() error {
+		_, e := cELB.DeregisterTargets(ctx, &elbv2.DeregisterTargetsInput{
+			TargetGroupArn: awssdk.String(config.TargetGroupARN),
+			Targets:        []elbtypes.TargetDescription{{Id: awssdk.String(elegido)}},
+		})
+		return e
+	})
+	if err != nil {
+		return "", fmt.Errorf("fallo al desregistrar la instancia %s del target group: %w", elegido, err)
+	}
+
+	// 2. Esperar el draining (síncrono).
+	esperarDraining(ctx, cELB, elegido)
+
+	// 3. Terminar la instancia.
+	err = Reintentar(ctx, "TerminateInstances", func() error {
+		_, e := cEC2.TerminateInstances(ctx, &ec2.TerminateInstancesInput{
+			InstanceIds: []string{elegido},
+		})
+		return e
 	})
 	if err != nil {
 		return "", fmt.Errorf("fallo al terminar la instancia %s: %w", elegido, err)

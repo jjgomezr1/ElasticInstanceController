@@ -58,10 +58,10 @@ func main() {
 		}
 	}
 
-	// --- Pieza 2: métricas de CPU desde CloudWatch ---
-	fmt.Printf("\n[Pieza 2] Consultando CPU en CloudWatch (ventana %s, punto %ds)...\n",
+	// --- Pieza 2: métricas desde CloudWatch (CPU + latencia + hosts) ---
+	fmt.Printf("\n[Pieza 2] Consultando metricas en CloudWatch (ventana %s, punto %ds)...\n",
 		config.VentanaObservacion, config.PeriodoPuntoSegundos)
-	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, ids)
+	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, clientes.ELB, ids)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR consultando CloudWatch: %v\n", err)
 		os.Exit(1)
@@ -70,6 +70,8 @@ func main() {
 	fmt.Println("Snapshot construido:")
 	fmt.Printf("  Instancias corriendo : %d\n", snap.InstanciasCorriendo)
 	fmt.Printf("  CPU maxima           : %.2f%%\n", snap.CPUMax)
+	fmt.Printf("  Latencia             : %.3fs\n", snap.LatenciaAvg)
+	fmt.Printf("  Hosts saludables     : %d\n", snap.HostsSaludables)
 	fmt.Printf("  Metrica confiable    : %t\n", snap.MetricaConfiable)
 	fmt.Printf("  En cooldown          : %t\n", snap.EnCooldown)
 

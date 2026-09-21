@@ -77,8 +77,9 @@ func main() {
 // y el bucle continúa observando.
 func ejecutarCiclo(clientes *awsclient.Clientes, est *state.Estado, ahora time.Time) {
 	// Cada ciclo tiene su propio context acotado, para que una llamada colgada
-	// de AWS no congele el bucle.
-	ctx, cancelar := context.WithTimeout(context.Background(), 45*time.Second)
+	// de AWS no congele el bucle. El timeout debe dar espacio a los reintentos
+	// (hasta 2 × EsperaEntreReintentos = 40s de esperas, más las llamadas).
+	ctx, cancelar := context.WithTimeout(context.Background(), 2*time.Minute)
 	defer cancelar()
 
 	// 1. Inventario (Pieza 1).
@@ -89,8 +90,8 @@ func ejecutarCiclo(clientes *awsclient.Clientes, est *state.Estado, ahora time.T
 		return
 	}
 
-	// 2. Métricas de CPU (Pieza 2) -> Snapshot.
-	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, ids)
+	// 2. Métricas (Pieza 2): CPU + latencia + hosts saludables -> Snapshot.
+	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, clientes.ELB, ids)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "[%s] ciclo abortado: fallo metricas: %v\n",
 			ahora.Format(time.RFC3339), err)
@@ -107,20 +108,20 @@ func ejecutarCiclo(clientes *awsclient.Clientes, est *state.Estado, ahora time.T
 	resultado := "sin accion"
 	switch decision.Accion {
 	case policy.Subir:
-		id, err := awsclient.LanzarInstancia(ctx, clientes.EC2, clientes.SSM)
+		id, err := awsclient.LanzarInstancia(ctx, clientes.EC2, clientes.ELB)
 		if err != nil {
 			resultado = "ERROR al lanzar: " + err.Error()
 		} else {
-			resultado = "instancia lanzada " + id
+			resultado = "instancia lanzada y registrada " + id
 			est.RegistrarSubida(ahora)
 		}
 
 	case policy.Bajar:
-		id, err := awsclient.TerminarInstancia(ctx, clientes.EC2, ids)
+		id, err := awsclient.TerminarInstancia(ctx, clientes.EC2, clientes.ELB, ids)
 		if err != nil {
 			resultado = "ERROR al terminar: " + err.Error()
 		} else {
-			resultado = "instancia terminada " + id
+			resultado = "instancia desregistrada y terminada " + id
 			est.RegistrarBajada(ahora)
 		}
 	}

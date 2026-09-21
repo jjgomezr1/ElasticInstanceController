@@ -8,20 +8,20 @@ import (
 	"context"
 	"fmt"
 
-	awssdk "github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/config"
 	"github.com/aws/aws-sdk-go-v2/service/cloudwatch"
 	"github.com/aws/aws-sdk-go-v2/service/ec2"
-	"github.com/aws/aws-sdk-go-v2/service/ssm"
+	elbv2 "github.com/aws/aws-sdk-go-v2/service/elasticloadbalancingv2"
 )
 
 // Clientes agrupa los clientes de los servicios de AWS que usa el controlador.
 // Se construyen una sola vez al arrancar y se reutilizan en cada ciclo.
-// Cuando agreguemos el ALB, se añadirá aquí su cliente.
 type Clientes struct {
 	EC2        *ec2.Client
 	CloudWatch *cloudwatch.Client
-	SSM        *ssm.Client // para resolver la AMI vía parámetro público
+	// ELB es el cliente de Elastic Load Balancing v2: registra/desregistra
+	// instancias en el Target Group y consulta la salud de los targets.
+	ELB *elbv2.Client
 }
 
 // NuevosClientes carga la configuración por defecto del SDK y construye los
@@ -48,11 +48,6 @@ func NuevosClientes(ctx context.Context) (*Clientes, error) {
 	return &Clientes{
 		EC2:        ec2.NewFromConfig(cfg),
 		CloudWatch: cloudwatch.NewFromConfig(cfg),
-		SSM:        ssm.NewFromConfig(cfg),
+		ELB:        elbv2.NewFromConfig(cfg),
 	}, nil
 }
-
-// _ evita que el import de awssdk quede sin uso mientras solo tenemos EC2.
-// (Se usará de verdad cuando pasemos punteros de tipos aws.* en las piezas
-// siguientes; se deja el import listo para no reescribir la cabecera.)
-var _ = awssdk.String

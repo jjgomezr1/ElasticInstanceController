@@ -20,6 +20,17 @@ import (
 // lista alimenta la Pieza 2 (métricas de CPU) y su longitud es la cantidad de
 // instancias corriendo que usa policy.Decide().
 func ListManagedInstances(ctx context.Context, cliente *ec2.Client) ([]string, error) {
+	// Toda la operación de inventario va envuelta en reintentos: si cualquier
+	// página falla por un fallo transitorio de AWS, se reintenta el inventario
+	// completo.
+	return ReintentarConValor(ctx, "inventario EC2", func() ([]string, error) {
+		return listarInstancias(ctx, cliente)
+	})
+}
+
+// listarInstancias hace la consulta real a EC2 (sin reintentos; de eso se
+// encarga ListManagedInstances).
+func listarInstancias(ctx context.Context, cliente *ec2.Client) ([]string, error) {
 	// Los filtros se aplican del lado de AWS: pedimos directamente lo que nos
 	// interesa en vez de traer todo y filtrar en Go.
 	entrada := &ec2.DescribeInstancesInput{

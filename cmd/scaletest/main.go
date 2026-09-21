@@ -2,19 +2,16 @@
 // forma CONTROLADA, sin necesitar carga real. Es la Pieza 7 (inyección de
 // métricas sintéticas) combinada con un disparador manual.
 //
-// Flujo: inventario (Pieza 1) -> CPU (real de la Pieza 2, o inyectada con
-// -cpu) -> Decide (Pieza 3) -> actuar (Pieza 4/5) si se pasa -actuar.
+// Flujo: inventario (Pieza 1) -> métricas reales (Pieza 2) con posible
+// inyección de CPU/latencia -> Decide (Pieza 3) -> actuar (Pieza 4/5) si se
+// pasa -actuar.
 //
 // Ejemplos:
 //
-//	# Ver qué decidiría con CPU real, SIN actuar (dry-run):
-//	./scaletest
-//
-//	# Simular CPU al 85% y ver la decisión, SIN actuar:
-//	./scaletest -cpu 85
-//
-//	# Simular CPU al 85% y EJECUTAR de verdad (lanza una instancia real):
-//	./scaletest -cpu 85 -actuar
+//	./scaletest                      # CPU/latencia reales, dry-run
+//	./scaletest -cpu 85              # simula CPU 85%, dry-run
+//	./scaletest -latencia 2.0        # simula latencia 2s, dry-run
+//	./scaletest -cpu 85 -actuar      # simula CPU 85% y EJECUTA (lanza real)
 //
 // El flag -actuar es un seguro: sin él, scaletest nunca toca la
 // infraestructura, solo informa qué haría.
@@ -32,14 +29,12 @@ import (
 )
 
 func main() {
-	// -cpu: si es >= 0, reemplaza la CPU real por este valor (inyección).
-	//       Por defecto -1 = usar la CPU real de CloudWatch.
 	cpuInyectada := flag.Float64("cpu", -1, "CPU maxima sintetica (0-100). Si se omite, usa la CPU real.")
-	// -actuar: seguro. Sin este flag, es dry-run (solo informa).
+	latInyectada := flag.Float64("latencia", -1, "Latencia sintetica en segundos. Si se omite, usa la real.")
 	actuar := flag.Bool("actuar", false, "Si se pasa, EJECUTA la accion real (lanzar/terminar). Sin el, solo informa.")
 	flag.Parse()
 
-	ctx, cancelar := context.WithTimeout(context.Background(), 60*time.Second)
+	ctx, cancelar := context.WithTimeout(context.Background(), 90*time.Second)
 	defer cancelar()
 
 	fmt.Println("== scaletest: prueba controlada del pipeline de escalado ==")
@@ -61,26 +56,31 @@ func main() {
 		fmt.Printf("  - %s\n", id)
 	}
 
-	// --- Pieza 2: CPU (real o inyectada) ---
-	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, ids)
+	// --- Pieza 2: métricas reales (CPU + latencia + hosts) ---
+	snap, err := awsclient.ObtenerSnapshot(ctx, clientes.CloudWatch, clientes.ELB, ids)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "ERROR metricas: %v\n", err)
 		os.Exit(1)
 	}
 
-	// Pieza 7: si se inyectó una CPU, sobreescribimos la real. La marcamos
-	// como confiable a mano, porque el dato viene de quien prueba, no de una
-	// métrica que pueda estar obsoleta.
+	// Pieza 7: inyección opcional de CPU y/o latencia. Al inyectar, marcamos
+	// la métrica como confiable porque el dato lo pone quien prueba.
 	if *cpuInyectada >= 0 {
-		fmt.Printf("\n[INYECCION] Sobrescribiendo CPU real (%.2f%%) por CPU sintetica %.2f%%\n",
-			snap.CPUMax, *cpuInyectada)
+		fmt.Printf("\n[INYECCION] CPU real %.2f%% -> sintetica %.2f%%\n", snap.CPUMax, *cpuInyectada)
 		snap.CPUMax = *cpuInyectada
+		snap.MetricaConfiable = true
+	}
+	if *latInyectada >= 0 {
+		fmt.Printf("[INYECCION] Latencia real %.3fs -> sintetica %.3fs\n", snap.LatenciaAvg, *latInyectada)
+		snap.LatenciaAvg = *latInyectada
 		snap.MetricaConfiable = true
 	}
 
 	fmt.Println("\nSnapshot para decidir:")
 	fmt.Printf("  Instancias corriendo : %d\n", snap.InstanciasCorriendo)
 	fmt.Printf("  CPU maxima           : %.2f%%\n", snap.CPUMax)
+	fmt.Printf("  Latencia             : %.3fs\n", snap.LatenciaAvg)
+	fmt.Printf("  Hosts saludables     : %d\n", snap.HostsSaludables)
 	fmt.Printf("  Metrica confiable    : %t\n", snap.MetricaConfiable)
 	fmt.Printf("  En cooldown          : %t\n", snap.EnCooldown)
 
@@ -89,7 +89,7 @@ func main() {
 	fmt.Printf("\nDecision: %s\n", decision.Accion)
 	fmt.Printf("Motivo  : %s\n", decision.Motivo)
 
-	// --- Pieza 4/5: actuar (solo si se pidió con -actuar) ---
+	// --- Pieza 4/5: actuar (solo con -actuar) ---
 	if !*actuar {
 		fmt.Println("\n(dry-run: no se ejecuta ninguna accion. Pasa -actuar para ejecutar de verdad.)")
 		return
@@ -97,24 +97,23 @@ func main() {
 
 	switch decision.Accion {
 	case policy.Subir:
-		fmt.Println("\n[ACTUAR] Lanzando una instancia nueva...")
-		id, err := awsclient.LanzarInstancia(ctx, clientes.EC2, clientes.SSM)
+		fmt.Println("\n[ACTUAR] Lanzando una instancia nueva y registrandola en el target group...")
+		id, err := awsclient.LanzarInstancia(ctx, clientes.EC2, clientes.ELB)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR al lanzar: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("Instancia lanzada: %s\n", id)
-		fmt.Println("(Tarda 1-2 min en aparecer como 'running' y en el inventario.)")
+		fmt.Println("(Tarda 1-2 min en quedar 'running' y healthy en el ALB.)")
 
 	case policy.Bajar:
-		fmt.Println("\n[ACTUAR] Terminando una instancia (la mas nueva)...")
-		id, err := awsclient.TerminarInstancia(ctx, clientes.EC2, ids)
+		fmt.Println("\n[ACTUAR] Desregistrando, drenando y terminando una instancia (la mas nueva)...")
+		id, err := awsclient.TerminarInstancia(ctx, clientes.EC2, clientes.ELB, ids)
 		if err != nil {
 			fmt.Fprintf(os.Stderr, "ERROR al terminar: %v\n", err)
 			os.Exit(1)
 		}
 		fmt.Printf("Instancia terminada: %s\n", id)
-		fmt.Println("(Tarda ~1 min en pasar a 'terminated' y salir del inventario.)")
 
 	default:
 		fmt.Println("\n[ACTUAR] La decision es mantener; no hay nada que ejecutar.")

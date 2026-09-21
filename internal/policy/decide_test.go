@@ -2,93 +2,78 @@ package policy
 
 import "testing"
 
-// TestDecide usa "table-driven tests": una tabla de casos, un solo bucle que
-// los recorre. Cada caso describe un Snapshot de entrada y la Accion que se
-// espera de vuelta. Cubre los casos límite relevantes de la política CPU-only.
+// TestDecide cubre la política final (CPU + latencia + hosts saludables) con
+// table-driven tests. Umbrales: CPU 60/30, latencia 1.0/0.4.
 func TestDecide(t *testing.T) {
+	// Snapshot base "sano" que por defecto lleva a mantener; cada caso ajusta
+	// solo los campos que le interesan.
+	base := func() Snapshot {
+		return Snapshot{
+			InstanciasCorriendo: 2,
+			CPUMax:              45, // banda normal
+			LatenciaAvg:         0.5,
+			HostsSaludables:     2,
+			MetricaConfiable:    true,
+			EnCooldown:          false,
+		}
+	}
+
 	casos := []struct {
 		nombre   string
-		entrada  Snapshot
+		ajustar  func(s *Snapshot)
 		esperada Accion
 	}{
-		// --- Guardas de seguridad (van antes que cualquier umbral) ---
-		{
-			nombre:   "metrica no confiable con CPU alta: mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 95, MetricaConfiable: false},
-			esperada: Mantener,
-		},
-		{
-			nombre:   "en cooldown con CPU alta: mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 95, MetricaConfiable: true, EnCooldown: true},
-			esperada: Mantener,
-		},
-		{
-			nombre:   "en cooldown con CPU baja: mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 3, CPUMax: 5, MetricaConfiable: true, EnCooldown: true},
-			esperada: Mantener,
-		},
+		// --- Guardas de seguridad ---
+		{"metrica no confiable con CPU alta: mantiene",
+			func(s *Snapshot) { s.CPUMax = 95; s.MetricaConfiable = false }, Mantener},
+		{"en cooldown con CPU alta: mantiene",
+			func(s *Snapshot) { s.CPUMax = 95; s.EnCooldown = true }, Mantener},
 
-		// --- Subir ---
-		{
-			nombre:   "CPU muy alta con margen: sube",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 85, MetricaConfiable: true},
-			esperada: Subir,
-		},
-		{
-			nombre:   "CPU justo por encima del umbral (70.01): sube",
-			entrada:  Snapshot{InstanciasCorriendo: 1, CPUMax: 70.01, MetricaConfiable: true},
-			esperada: Subir,
-		},
-		{
-			nombre:   "CPU exactamente en el umbral de subida (70.0): mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 1, CPUMax: 70.0, MetricaConfiable: true},
-			esperada: Mantener,
-		},
-		{
-			nombre:   "CPU alta pero ya en el maximo de instancias: mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 5, CPUMax: 99, MetricaConfiable: true},
-			esperada: Mantener,
-		},
+		// --- Subir por CPU ---
+		{"CPU por encima de 60 con margen: sube",
+			func(s *Snapshot) { s.CPUMax = 75 }, Subir},
+		{"CPU justo sobre el umbral (60.01): sube",
+			func(s *Snapshot) { s.CPUMax = 60.01 }, Subir},
+		{"CPU exactamente en 60: mantiene (umbral estricto)",
+			func(s *Snapshot) { s.CPUMax = 60.0 }, Mantener},
+		{"CPU alta pero ya en el maximo: mantiene",
+			func(s *Snapshot) { s.CPUMax = 95; s.InstanciasCorriendo = 5; s.HostsSaludables = 5 }, Mantener},
+
+		// --- Subir por LATENCIA (aunque CPU esté baja) ---
+		{"latencia alta con CPU baja: sube",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 2.0 }, Subir},
+		{"latencia justo sobre 1s: sube",
+			func(s *Snapshot) { s.LatenciaAvg = 1.01 }, Subir},
+		{"latencia exactamente 1s: no sube por latencia",
+			func(s *Snapshot) { s.CPUMax = 45; s.LatenciaAvg = 1.0 }, Mantener},
 
 		// --- Bajar ---
-		{
-			nombre:   "CPU muy baja con instancias de sobra: baja",
-			entrada:  Snapshot{InstanciasCorriendo: 3, CPUMax: 10, MetricaConfiable: true},
-			esperada: Bajar,
-		},
-		{
-			nombre:   "CPU justo por debajo del umbral (29.99): baja",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 29.99, MetricaConfiable: true},
-			esperada: Bajar,
-		},
-		{
-			nombre:   "CPU exactamente en el umbral de bajada (30.0): mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 30.0, MetricaConfiable: true},
-			esperada: Mantener,
-		},
-		{
-			nombre:   "CPU baja pero ya en el minimo de instancias: mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 1, CPUMax: 5, MetricaConfiable: true},
-			esperada: Mantener,
-		},
+		{"CPU y latencia bajas, hosts sanos, con margen: baja",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 0.2; s.InstanciasCorriendo = 3; s.HostsSaludables = 3 }, Bajar},
+		{"carga baja pero ya en el minimo: mantiene",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 0.2; s.InstanciasCorriendo = 1; s.HostsSaludables = 1 }, Mantener},
+		{"carga baja pero un host no sano: mantiene",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 0.2; s.InstanciasCorriendo = 3; s.HostsSaludables = 2 }, Mantener},
+		{"CPU baja pero latencia en banda muerta (0.5): mantiene",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 0.5; s.InstanciasCorriendo = 3; s.HostsSaludables = 3 }, Mantener},
+		{"CPU baja pero latencia justo en 0.4: mantiene (umbral estricto)",
+			func(s *Snapshot) { s.CPUMax = 10; s.LatenciaAvg = 0.4; s.InstanciasCorriendo = 3; s.HostsSaludables = 3 }, Mantener},
 
-		// --- Banda intermedia (just-in-need) ---
-		{
-			nombre:   "CPU en banda normal (50): mantiene",
-			entrada:  Snapshot{InstanciasCorriendo: 2, CPUMax: 50, MetricaConfiable: true},
-			esperada: Mantener,
-		},
+		// --- Banda intermedia ---
+		{"CPU y latencia en banda normal: mantiene",
+			func(s *Snapshot) {}, Mantener},
 	}
 
 	for _, c := range casos {
 		t.Run(c.nombre, func(t *testing.T) {
-			got := Decide(c.entrada)
+			s := base()
+			c.ajustar(&s)
+			got := Decide(s)
 			if got.Accion != c.esperada {
-				t.Errorf("Decide() = %v (motivo: %q); se esperaba %v",
-					got.Accion, got.Motivo, c.esperada)
+				t.Errorf("Decide() = %v (motivo: %q); se esperaba %v", got.Accion, got.Motivo, c.esperada)
 			}
 			if got.Motivo == "" {
-				t.Errorf("Decide() devolvio un motivo vacio; toda decision debe ser explicable")
+				t.Errorf("Decide() devolvio motivo vacio; toda decision debe ser explicable")
 			}
 		})
 	}

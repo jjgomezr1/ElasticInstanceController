@@ -5,7 +5,11 @@
 // determinista con `go test`, sin tocar la infraestructura real.
 package policy
 
-import "autoscaling-controller/internal/config"
+import (
+	"fmt"
+
+	"autoscaling-controller/internal/config"
+)
 
 // Accion es el resultado categórico de una decisión: una de tres palabras.
 type Accion int
@@ -55,14 +59,16 @@ type Snapshot struct {
 	// estabilicen).
 	EnCooldown bool
 
-	// --- Campos de ALB: reservados para una fase futura. ---
-	// Hoy NO se usan en Decide() porque no existe el Load Balancer todavía.
-	// Se dejan presentes para que agregar la lógica de ALB más adelante no
-	// obligue a cambiar la firma de Decide() ni de quienes construyen el
-	// Snapshot.
-	LatenciaAvg     float64 // TargetResponseTime (segundos) — sin uso aún.
-	Errores5xx      int     // HTTPCode_Target_5XX_Count — sin uso aún.
-	HostsSaludables int     // HealthyHostCount — sin uso aún.
+	// --- Métricas del ALB (fase ALB) ---
+
+	// LatenciaAvg es el TargetResponseTime del ALB (segundos): cuánto tarda el
+	// target en responder. Señal de experiencia de usuario.
+	LatenciaAvg float64
+
+	// HostsSaludables es el HealthyHostCount del Target Group: cuántas
+	// instancias están sanas según el health check del ALB. Se usa como guarda
+	// de seguridad para bajar (no reducir si alguna no está sana).
+	HostsSaludables int
 }
 
 // Decision es lo que Decide() devuelve: la acción a tomar y una justificación
@@ -72,26 +78,31 @@ type Decision struct {
 	Motivo string
 }
 
-// Decide es el corazón de la política. Dada una foto del estado, decide si
-// mantener, subir o bajar. En esta fase la CPU es la ÚNICA métrica.
+// Decide es el corazón de la política. Usa tres métricas: CPU, latencia y
+// hosts saludables, con histéresis para evitar oscilación.
 //
-// Orden de evaluación (importa: las guardas de seguridad van primero):
-//  1. Si la métrica no es confiable -> mantener.
-//  2. Si estamos en cooldown -> mantener.
-//  3. Subir: CPU por encima del umbral Y aún hay margen para más instancias.
-//  4. Bajar: CPU por debajo del umbral Y hay más de una instancia.
+//	Subir = (CPU > CPUSubir  O  latencia > LatenciaSubir)  Y  instancias < max
+//	Bajar =  CPU < CPUBajar  Y  latencia < LatenciaBajar
+//	        Y  hosts_sanos == instancias  Y  instancias > min
+//
+// Filosofía: fácil subir (proteger al usuario), difícil bajar (conservador).
+//
+// Orden de evaluación (las guardas de seguridad van primero):
+//  1. Métrica no confiable -> mantener.
+//  2. Cooldown -> mantener.
+//  3. Subir (CPU alta O latencia alta) si hay margen.
+//  4. Bajar (todo tranquilo y hosts sanos) si hay más de la mínima.
 //  5. En cualquier otro caso -> mantener.
 func Decide(s Snapshot) Decision {
 	// 1. Datos no confiables: no decidir en falso.
 	if !s.MetricaConfiable {
 		return Decision{
 			Accion: Mantener,
-			Motivo: "metrica de CPU no confiable (obsoleta o faltante); se mantiene el estado actual",
+			Motivo: "metrica no confiable (obsoleta o faltante); se mantiene el estado actual",
 		}
 	}
 
-	// 2. Cooldown activo: dar tiempo a que el efecto de la acción previa se
-	// asiente antes de tomar otra.
+	// 2. Cooldown activo.
 	if s.EnCooldown {
 		return Decision{
 			Accion: Mantener,
@@ -99,38 +110,51 @@ func Decide(s Snapshot) Decision {
 		}
 	}
 
-	// 3. ¿Subir? Requiere CPU alta y no haber llegado al tope de instancias.
-	if s.CPUMax > config.CPUSubir {
+	// 3. ¿Subir? CPU alta O latencia alta (proteger al usuario).
+	cpuAlta := s.CPUMax > config.CPUSubir
+	latenciaAlta := s.LatenciaAvg > config.LatenciaSubir
+	if cpuAlta || latenciaAlta {
 		if s.InstanciasCorriendo >= config.MaxInstancias {
 			return Decision{
 				Accion: Mantener,
-				Motivo: "CPU alta pero ya se alcanzo el maximo de instancias; se mantiene",
+				Motivo: "carga alta pero ya se alcanzo el maximo de instancias; se mantiene",
 			}
 		}
 		return Decision{
 			Accion: Subir,
-			Motivo: "CPU maxima por encima del umbral de subida con margen de capacidad disponible",
+			Motivo: fmt.Sprintf("subir: CPU=%.1f%% (umbral %.0f) o latencia=%.2fs (umbral %.2f)",
+				s.CPUMax, config.CPUSubir, s.LatenciaAvg, config.LatenciaSubir),
 		}
 	}
 
-	// 4. ¿Bajar? Requiere CPU baja y tener más de la instancia mínima.
-	if s.CPUMax < config.CPUBajar {
+	// 4. ¿Bajar? Todo tranquilo Y todos los hosts sanos Y por encima del mínimo.
+	cpuBaja := s.CPUMax < config.CPUBajar
+	latenciaBaja := s.LatenciaAvg < config.LatenciaBajar
+	hostsTodosSanos := s.HostsSaludables == s.InstanciasCorriendo
+	if cpuBaja && latenciaBaja {
 		if s.InstanciasCorriendo <= config.MinInstancias {
 			return Decision{
 				Accion: Mantener,
-				Motivo: "CPU baja pero ya se esta en el minimo de instancias; se mantiene",
+				Motivo: "carga baja pero ya se esta en el minimo de instancias; se mantiene",
+			}
+		}
+		if !hostsTodosSanos {
+			return Decision{
+				Accion: Mantener,
+				Motivo: fmt.Sprintf("carga baja pero no todos los hosts estan sanos (%d sanos de %d); no se baja",
+					s.HostsSaludables, s.InstanciasCorriendo),
 			}
 		}
 		return Decision{
 			Accion: Bajar,
-			Motivo: "CPU maxima por debajo del umbral de bajada con instancias de sobra",
+			Motivo: fmt.Sprintf("bajar: CPU=%.1f%% y latencia=%.2fs bajas, %d hosts sanos == %d instancias",
+				s.CPUMax, s.LatenciaAvg, s.HostsSaludables, s.InstanciasCorriendo),
 		}
 	}
 
-	// 5. Zona intermedia (entre los umbrales): estado "just-in-need", no se
-	// toca la capacidad.
+	// 5. Zona intermedia (just-in-need): capacidad adecuada.
 	return Decision{
 		Accion: Mantener,
-		Motivo: "CPU dentro de la banda normal; capacidad adecuada, se mantiene",
+		Motivo: "metricas dentro de la banda normal; capacidad adecuada, se mantiene",
 	}
 }

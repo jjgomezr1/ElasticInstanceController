@@ -29,19 +29,30 @@ const (
 	MaxInstancias = 5
 )
 
-// --- Umbrales de CPU (en porcentaje, 0-100) ---
+// --- Umbrales de decisión ---
 //
-// En esta fase (sin ALB) la CPU es la ÚNICA métrica de decisión. El margen
-// del 70% para subir deja un 30% de holgura para que una instancia nueva
-// alcance a levantarse antes de que la carga llegue a un estado crítico.
+// Política final (fase ALB), con histéresis entre subir y bajar para evitar
+// oscilación:
+//   Subir  = (CPU > CPUSubir  O  latencia > LatenciaSubir)  Y  instancias < max
+//   Bajar  =  CPU < CPUBajar  Y  latencia < LatenciaBajar
+//            Y  hosts_sanos == instancias  Y  instancias > min
+//
+// El umbral de subida de CPU es 60% (no 70%) por la naturaleza "burstable" de
+// la t3.micro: su baseline sostenible es ~10-20%, así que conviene escalar
+// antes de que se agoten los créditos de CPU.
 
 const (
-	// CPUSubir: si la CPU máxima observada supera este valor, se considera
-	// subir una instancia.
-	CPUSubir = 70.0
-	// CPUBajar: si la CPU máxima observada queda por debajo de este valor, se
-	// considera bajar una instancia.
+	// CPUSubir: CPU máxima por encima de este valor empuja a subir.
+	CPUSubir = 60.0
+	// CPUBajar: CPU máxima por debajo de este valor habilita bajar.
 	CPUBajar = 30.0
+
+	// LatenciaSubir: TargetResponseTime (segundos) por encima de este valor
+	// empuja a subir (el usuario está esperando demasiado).
+	LatenciaSubir = 1.0
+	// LatenciaBajar: TargetResponseTime por debajo de este valor es condición
+	// (entre otras) para poder bajar. La banda 0.4-1.0s es zona muerta.
+	LatenciaBajar = 0.4
 )
 
 // --- Ventana de observación y consulta de métricas ---
@@ -80,6 +91,22 @@ const (
 	CooldownBajada = 6 * time.Minute
 )
 
+// --- Draining (bajada segura con ALB) ---
+//
+// Al bajar: desregistrar el target -> esperar el draining -> terminar. El
+// deregistration delay del Target Group está configurado en 30s (la app
+// responde en milisegundos, no necesita más). Sondeamos el estado del target
+// hasta que deje de estar "draining", con un tope de espera por seguridad.
+
+const (
+	// EsperaMaxDraining es el tope de tiempo que esperamos a que un target
+	// salga del estado "draining" antes de terminar de todos modos.
+	EsperaMaxDraining = 45 * time.Second
+	// IntervaloSondeoDraining es cada cuánto consultamos el estado del target
+	// durante el draining.
+	IntervaloSondeoDraining = 5 * time.Second
+)
+
 // --- Ritmo del ciclo principal y reintentos ante fallos de AWS ---
 
 const (
@@ -107,29 +134,42 @@ const (
 	TagValor = "autoscaling-controller"
 )
 
-// --- Parámetros para lanzar instancias nuevas (Pieza 4) ---
+// --- Parámetros de infraestructura (fase ALB) ---
 //
-// Son valores propios de la cuenta/región. Tienen un valor por defecto acorde
-// al Learner Lab, pero se pueden sobreescribir por variable de entorno sin
-// recompilar (útil si el security group o la key cambian de nombre).
+// Son valores propios de la cuenta/región/despliegue. Tienen un valor por
+// defecto acorde al entorno actual, pero se pueden sobreescribir por variable
+// de entorno sin recompilar (recomendado, porque estos IDs cambian si se
+// recrea la infraestructura).
 var (
 	// TipoInstancia es el tipo EC2 de las instancias sujeto que se lanzan.
 	TipoInstancia = getenv("TIPO_INSTANCIA", "t3.micro")
 
-	// KeyPair es el par de claves para poder entrar por SSH a las instancias
-	// lanzadas.
+	// KeyPair es el par de claves para poder entrar por SSH a las instancias.
 	KeyPair = getenv("KEY_PAIR", "vockey")
 
-	// SecurityGroupID es el grupo de seguridad que se asigna a las instancias
-	// lanzadas (el que permite SSH y el tráfico de la app).
-	SecurityGroupID = getenv("SECURITY_GROUP", "sg-0eb76ab33dcac3913")
+	// AMIImagen es la AMI DORADA con la app inversora ya instalada como
+	// servicio (arranca sola al bootear). El controlador lanza copias de esta
+	// imagen; así cada instancia nueva queda lista para el ALB sin
+	// intervención. Reemplaza al antiguo parámetro SSM de Ubuntu vacía.
+	AMIImagen = getenv("AMI_ID", "ami-01c0739a01c678a19")
 
-	// ParametroSSMImagen es el nombre del parámetro público de SSM que siempre
-	// apunta al ID de la AMI más reciente de Ubuntu 24.04 (Noble) amd64 en la
-	// región actual. Resolverlo en tiempo de ejecución evita hardcodear un
-	// ami-... que cambia por región y con el tiempo.
-	ParametroSSMImagen = getenv(
-		"SSM_AMI_PARAM",
-		"/aws/service/canonical/ubuntu/server/24.04/stable/current/amd64/hvm/ebs-gp3/ami-id",
+	// SubnetID es la subred (pública, en la VPC del proyecto) donde se lanzan
+	// las instancias sujeto. Debe estar en la misma VPC que el ALB.
+	SubnetID = getenv("SUBNET_ID", "subnet-036fdfb4a9105016f")
+
+	// SecurityGroupID es el grupo de seguridad de las instancias sujeto
+	// (sg-instancias): solo acepta HTTP desde el ALB, y SSH para depurar.
+	SecurityGroupID = getenv("SECURITY_GROUP", "sg-09da9e06537de936d")
+
+	// TargetGroupARN es el ARN del Target Group del ALB. El controlador
+	// registra ahí las instancias que lanza y las desregistra antes de
+	// terminarlas.
+	TargetGroupARN = getenv(
+		"TARGET_GROUP_ARN",
+		"arn:aws:elasticloadbalancing:us-east-1:361114871808:targetgroup/tg-InversorApp/bb56724fea044efd",
 	)
+
+	// ALBNombre es el nombre del Application Load Balancer, usado como
+	// dimensión al consultar TargetResponseTime en CloudWatch.
+	ALBNombre = getenv("ALB_NOMBRE", "alb-InversorApp")
 )

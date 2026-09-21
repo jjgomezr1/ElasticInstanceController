@@ -23,9 +23,11 @@ import (
 // instancia lanzada/terminada, "sin accion", o el texto de un error.
 func RegistrarCiclo(ahora time.Time, snap policy.Snapshot, decision policy.Decision, resultado string) {
 	fmt.Printf(
-		"[%s] cpu_max=%.2f%% confiable=%t ventana=%s | instancias=%d/%d cooldown=%t | decision=%s (%s) | resultado=%s\n",
+		"[%s] cpu_max=%.2f%% latencia=%.3fs hosts_sanos=%d confiable=%t ventana=%s | instancias=%d/%d cooldown=%t | decision=%s (%s) | resultado=%s\n",
 		ahora.Format(time.RFC3339),
 		snap.CPUMax,
+		snap.LatenciaAvg,
+		snap.HostsSaludables,
 		snap.MetricaConfiable,
 		config.VentanaObservacion,
 		snap.InstanciasCorriendo,
