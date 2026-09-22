@@ -1,0 +1,29 @@
+[Unit]
+Description=Auto-Scaling Controller (SI3016)
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu
+ExecStart=/home/ubuntu/controller
+
+# Reinicio automatico ante fallas (requisito del diseno): si el proceso muere
+# por cualquier razon, systemd lo revive a los 5 segundos.
+Restart=always
+RestartSec=5
+
+# --- Parametros de infraestructura ---
+# Se definen aqui para que el despliegue quede autodocumentado y no dependa de
+# los valores por defecto del codigo. Ajusta si recreas la infraestructura.
+Environment=AMI_ID=ami-01c0739a01c678a19
+Environment=SUBNET_ID=subnet-036fdfb4a9105016f
+Environment=SECURITY_GROUP=sg-09da9e06537de936d
+Environment=TARGET_GROUP_ARN=arn:aws:elasticloadbalancing:us-east-1:361114871808:targetgroup/tg-InversorApp/bb56724fea044efd
+Environment=ALB_NOMBRE=alb-InversorApp
+Environment=TIPO_INSTANCIA=t3.micro
+Environment=KEY_PAIR=vockey
+
+[Install]
+WantedBy=multi-user.target
